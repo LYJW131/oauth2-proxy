@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,6 +36,7 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/ip"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/middleware"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/otk"
 	requestutil "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/requests/util"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/upstream"
@@ -114,6 +116,11 @@ type OAuthProxy struct {
 	appDirector       redirect.AppDirector
 
 	encodeState bool
+
+	// One-time key store for cookieless authentication
+	otkStore   otk.Store
+	otkEnabled bool
+	userMapper *otk.UserMapper
 }
 
 // NewOAuthProxy creates a new instance of OAuthProxy from the options provided
@@ -248,7 +255,23 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		redirectValidator:  redirectValidator,
 		appDirector:        appDirector,
 		encodeState:        opts.EncodeState,
+
+		// Initialize one-time key store (always enabled in this specialized branch)
+		otkStore:   otk.NewMemoryStore(),
+		otkEnabled: true,
 	}
+
+	// Initialize user mapper from config file (optional)
+	if opts.OTKUserMappingFile != "" {
+		userMapper, err := otk.NewUserMapper(opts.OTKUserMappingFile)
+		if err != nil {
+			logger.Printf("Warning: failed to load user mapping file: %v", err)
+		} else {
+			p.userMapper = userMapper
+			logger.Printf("Loaded user mapping from %s", opts.OTKUserMappingFile)
+		}
+	}
+
 	p.buildServeMux(opts.ProxyPrefix)
 
 	if err := p.setupServer(opts); err != nil {
@@ -701,40 +724,115 @@ func (p *OAuthProxy) SignIn(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// UserInfo endpoint outputs session email and preferred username in JSON format
+// UserInfo endpoint for one-time key exchange
+// Accepts POST requests with Content-Type: text/plain
+// Request body format: action=exchange&access_token=<40-char-token>&app_id=<app_id>
 func (p *OAuthProxy) UserInfo(rw http.ResponseWriter, req *http.Request) {
-	session, err := p.getAuthenticatedSession(rw, req)
-	if err != nil {
-		http.Error(rw, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-		return
-	}
-
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(http.StatusOK)
-	if session == nil {
-		if _, err := rw.Write([]byte("{}")); err != nil {
-			logger.Printf("Error encoding empty user info: %v", err)
-			p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+
+	// Helper function to send error response
+	sendError := func(message string) {
+		response := struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}{
+			Success: false,
+			Error:   message,
 		}
+		logger.Printf("UserInfo response: success=false, error=%s", message)
+		json.NewEncoder(rw).Encode(response)
+	}
+
+	// Only accept POST requests
+	if req.Method != http.MethodPost {
+		sendError("method not allowed, use POST")
 		return
 	}
 
-	userInfo := struct {
-		User              string   `json:"user"`
-		Email             string   `json:"email"`
-		Groups            []string `json:"groups,omitempty"`
-		PreferredUsername string   `json:"preferredUsername,omitempty"`
-	}{
-		User:              session.User,
-		Email:             session.Email,
-		Groups:            session.Groups,
-		PreferredUsername: session.PreferredUsername,
+	// Read request body
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		sendError("failed to read request body")
+		return
+	}
+	defer req.Body.Close()
+
+	// Log request details for debugging
+	logger.Printf("UserInfo request: Method=%s, Content-Type=%s, Body=%s",
+		req.Method, req.Header.Get("Content-Type"), string(body))
+
+	// Parse the request body (format: action=exchange&access_token=xxx&app_id=xxx)
+	params, err := url.ParseQuery(string(body))
+	if err != nil {
+		sendError("failed to parse request body")
+		return
 	}
 
-	if err := json.NewEncoder(rw).Encode(userInfo); err != nil {
-		logger.Printf("Error encoding user info: %v", err)
-		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+	action := params.Get("action")
+	scope := params.Get("scope")
+	accessToken := params.Get("access_token")
+
+	// Validate action
+	if action != "exchange" {
+		sendError("invalid action")
+		return
 	}
+
+	// Validate scope
+	if scope != "userid" {
+		sendError("invalid scope")
+		return
+	}
+
+	// Validate access_token format (40 alphanumeric characters)
+	if len(accessToken) != 40 {
+		sendError("invalid access_token format")
+		return
+	}
+
+	// Validate user mapper is configured
+	if p.userMapper == nil {
+		sendError("user mapping not configured")
+		return
+	}
+
+	// Validate and consume the one-time key
+	if !p.otkEnabled || p.otkStore == nil {
+		sendError("one-time key service not available")
+		return
+	}
+
+	session, err := p.otkStore.Load(req.Context(), accessToken)
+	if err != nil {
+		logger.Printf("OTK validation failed: %v", err)
+		sendError("invalid or expired access_token")
+		return
+	}
+
+	logger.Printf("OTK validated and consumed for user: %s", session.Email)
+
+	// Look up user in mapping
+	userInfo, err := p.userMapper.GetUser(session.Email)
+	if err != nil {
+		sendError(fmt.Sprintf("user not found: %s", session.Email))
+		return
+	}
+
+	// Send success response
+	response := struct {
+		Success bool `json:"success"`
+		Data    struct {
+			UserID   int    `json:"user_id"`
+			UserName string `json:"user_name"`
+		} `json:"data"`
+	}{
+		Success: true,
+	}
+	response.Data.UserID = userInfo.UserID
+	response.Data.UserName = userInfo.UserName
+
+	logger.Printf("UserInfo response: success=true, user_id=%d, user_name=%s", userInfo.UserID, userInfo.UserName)
+	json.NewEncoder(rw).Encode(response)
 }
 
 // SignOut sends a response to clear the authentication cookie
@@ -933,6 +1031,40 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 	}
 	if p.Validator(session.Email) && authorized {
 		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Authenticated via OAuth2: %s", session)
+
+		// In OTK mode, generate a one-time key instead of setting a cookie
+		if p.otkEnabled && p.otkStore != nil {
+			otkKey, err := otk.GenerateKey(otk.DefaultKeyLength)
+			if err != nil {
+				logger.Errorf("Error generating one-time key: %v", err)
+				p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+				return
+			}
+
+			err = p.otkStore.Save(req.Context(), otkKey, session, otk.DefaultTTL)
+			if err != nil {
+				logger.Errorf("Error saving one-time key: %v", err)
+				p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+				return
+			}
+
+			// Append otk parameter to redirect URL
+			redirectURL, err := url.Parse(appRedirect)
+			if err != nil {
+				logger.Errorf("Error parsing redirect URL: %v", err)
+				p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+				return
+			}
+			query := redirectURL.Query()
+			query.Set("access_token", otkKey)
+			redirectURL.RawQuery = query.Encode()
+
+			logger.Printf("OTK mode: redirecting to %s with one-time key", redirectURL.String())
+			http.Redirect(rw, req, redirectURL.String(), http.StatusFound)
+			return
+		}
+
+		// Standard mode: save session to cookie
 		err := p.SaveSession(rw, req, session)
 		if err != nil {
 			logger.Errorf("Error saving session state for %s: %v", remoteAddr, err)

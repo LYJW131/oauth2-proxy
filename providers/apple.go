@@ -23,10 +23,7 @@ const (
 	appleProviderName = "Apple"
 	appleDefaultScope = "openid email name"
 
-	appleIssuerURL = "https://appleid.apple.com"
-	appleAuthURL   = "https://appleid.apple.com/auth/authorize"
-	appleTokenURL  = "https://appleid.apple.com/auth/token"
-	appleAudience  = "https://appleid.apple.com"
+	appleAudience = "https://appleid.apple.com"
 )
 
 var (
