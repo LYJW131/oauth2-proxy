@@ -55,6 +55,8 @@ const (
 	oauthCallbackPath = "/callback"
 	authOnlyPath      = "/auth"
 	userInfoPath      = "/userinfo"
+	registerPath      = "/register"
+	registerJWKSPath  = "/register/jwks.json"
 	staticPathPrefix  = "/static/"
 )
 
@@ -118,9 +120,13 @@ type OAuthProxy struct {
 	encodeState bool
 
 	// One-time key store for cookieless authentication
-	otkStore   otk.Store
-	otkEnabled bool
-	userMapper *otk.UserMapper
+	otkStore             otk.Store
+	otkEnabled           bool
+	userMapper           *otk.UserMapper
+	registerURL          string // URL to redirect to for user registration
+	registerTokenManager *otk.RegisterTokenManager
+	appID                string // Application identifier
+	ssoServerURL         string // SSO server URL for fetching user data
 }
 
 // NewOAuthProxy creates a new instance of OAuthProxy from the options provided
@@ -272,6 +278,19 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		}
 	}
 
+	// Set registration URL and token manager for unregistered users
+	if opts.RegisterURL != "" {
+		p.registerURL = opts.RegisterURL
+		tokenManager, err := otk.NewRegisterTokenManager()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create register token manager: %v", err)
+		}
+		p.registerTokenManager = tokenManager
+		p.appID = opts.AppID
+		p.ssoServerURL = opts.SSOServerURL
+		logger.Printf("Registration URL configured: %s (RS256 key pair generated, appID: %s, ssoServerURL: %s)", opts.RegisterURL, opts.AppID, opts.SSOServerURL)
+	}
+
 	p.buildServeMux(opts.ProxyPrefix)
 
 	if err := p.setupServer(opts); err != nil {
@@ -368,8 +387,10 @@ func (p *OAuthProxy) buildProxySubrouter(s *mux.Router) {
 	// Static file paths
 	s.PathPrefix(staticPathPrefix).Handler(http.StripPrefix(p.ProxyPrefix, http.FileServer(http.FS(staticFiles))))
 
-	// The userinfo and logout endpoints needs to load sessions before handling the request
+	// The userinfo, register, and logout endpoints
 	s.Path(userInfoPath).Handler(p.sessionChain.ThenFunc(p.UserInfo))
+	s.Path(registerPath).HandlerFunc(p.Register)
+	s.Path(registerJWKSPath).HandlerFunc(p.RegisterJWKS)
 	s.Path(signOutPath).Handler(p.sessionChain.ThenFunc(p.SignOut))
 }
 
@@ -809,30 +830,186 @@ func (p *OAuthProxy) UserInfo(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	logger.Printf("OTK validated and consumed for user: %s", session.Email)
+	logger.Printf("OTK validated and consumed for user: %s (sub: %s)", session.Email, session.User)
 
-	// Look up user in mapping
-	userInfo, err := p.userMapper.GetUser(session.Email)
+	// Look up user data in mapping by sub (OIDC subject identifier)
+	userData, err := p.userMapper.GetUserData(session.User)
 	if err != nil {
-		sendError(fmt.Sprintf("user not found: %s", session.Email))
+		sendError(fmt.Sprintf("user not found for sub: %s", session.User))
 		return
 	}
 
-	// Send success response
+	// Send success response with data directly from mapping
 	response := struct {
-		Success bool `json:"success"`
-		Data    struct {
-			UserID   int    `json:"user_id"`
-			UserName string `json:"user_name"`
-		} `json:"data"`
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
 	}{
 		Success: true,
+		Data:    userData,
 	}
-	response.Data.UserID = userInfo.UserID
-	response.Data.UserName = userInfo.UserName
 
-	logger.Printf("UserInfo response: success=true, user_id=%d, user_name=%s", userInfo.UserID, userInfo.UserName)
+	logger.Printf("UserInfo response: success=true, sub=%s", session.User)
 	json.NewEncoder(rw).Encode(response)
+}
+
+// Register handles user registration for new users
+// POST /oauth2/register
+// Body: token=<jwt>&access_token=<sso_access_token> (application/x-www-form-urlencoded)
+func (p *OAuthProxy) Register(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Content-Type", "application/json")
+
+	// Helper function to send error response
+	sendError := func(message string, statusCode int) {
+		rw.WriteHeader(statusCode)
+		response := struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}{
+			Success: false,
+			Error:   message,
+		}
+		logger.Printf("Register response: success=false, error=%s", message)
+		json.NewEncoder(rw).Encode(response)
+	}
+
+	// Only accept POST requests
+	if req.Method != http.MethodPost {
+		sendError("method not allowed, use POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse form data
+	if err := req.ParseForm(); err != nil {
+		sendError("failed to parse form data", http.StatusBadRequest)
+		return
+	}
+
+	token := req.PostForm.Get("token")
+	accessToken := req.PostForm.Get("access_token")
+
+	// Validate token is present
+	if token == "" {
+		sendError("missing token", http.StatusBadRequest)
+		return
+	}
+
+	// Validate access_token is present
+	if accessToken == "" {
+		sendError("missing access_token", http.StatusBadRequest)
+		return
+	}
+
+	// Check if register token manager is configured
+	if p.registerTokenManager == nil {
+		sendError("registration not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Check if SSO server URL is configured
+	if p.ssoServerURL == "" {
+		sendError("SSO server URL not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Validate JWT token using RS256
+	sub, _, _, err := p.registerTokenManager.ValidateToken(token)
+	if err != nil {
+		if err == otk.ErrTokenExpired {
+			sendError("token expired", http.StatusUnauthorized)
+		} else {
+			sendError("invalid token", http.StatusUnauthorized)
+		}
+		return
+	}
+
+	// Exchange access_token with SSO server to get user data
+	ssoURL := p.ssoServerURL + "/webman/sso/SSOAccessToken.cgi"
+	ssoBody := fmt.Sprintf("action=exchange&access_token=%s", accessToken)
+
+	ssoReq, err := http.NewRequestWithContext(req.Context(), "POST", ssoURL, strings.NewReader(ssoBody))
+	if err != nil {
+		logger.Errorf("Error creating SSO request: %v", err)
+		sendError("failed to create SSO request", http.StatusInternalServerError)
+		return
+	}
+	ssoReq.Header.Set("Content-Type", "text/plain")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	ssoResp, err := client.Do(ssoReq)
+	if err != nil {
+		logger.Errorf("Error calling SSO server: %v", err)
+		sendError("failed to contact SSO server", http.StatusBadGateway)
+		return
+	}
+	defer ssoResp.Body.Close()
+
+	// Parse SSO response
+	var ssoResponse struct {
+		Success bool            `json:"success"`
+		Data    json.RawMessage `json:"data"`
+	}
+
+	if err := json.NewDecoder(ssoResp.Body).Decode(&ssoResponse); err != nil {
+		logger.Errorf("Error parsing SSO response: %v", err)
+		sendError("invalid SSO response", http.StatusBadGateway)
+		return
+	}
+
+	if !ssoResponse.Success {
+		logger.Printf("SSO exchange failed for access_token")
+		sendError("SSO exchange failed", http.StatusUnauthorized)
+		return
+	}
+
+	if len(ssoResponse.Data) == 0 {
+		logger.Printf("SSO response missing data")
+		sendError("SSO response missing data", http.StatusBadGateway)
+		return
+	}
+
+	logger.Printf("SSO exchange successful, received user data")
+
+	// Check if user mapper is configured
+	if p.userMapper == nil {
+		sendError("user mapping not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Add user to mapping with data from SSO server
+	if err := p.userMapper.AddUser(sub, ssoResponse.Data); err != nil {
+		if err == otk.ErrUserAlreadyExists {
+			sendError("user already registered", http.StatusConflict)
+		} else {
+			logger.Errorf("Error adding user: %v", err)
+			sendError("failed to register user", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	logger.Printf("User registered successfully: sub=%s", sub)
+
+	logger.Printf("Registration complete (sub: %s), redirecting back to SSO Server: %s", sub, p.ssoServerURL)
+	http.Redirect(rw, req, p.ssoServerURL, http.StatusFound)
+}
+
+// RegisterJWKS returns the public key for registration token verification in JWKS format
+// GET /oauth2/register/jwks.json
+func (p *OAuthProxy) RegisterJWKS(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+
+	if p.registerTokenManager == nil {
+		http.Error(rw, "registration not configured", http.StatusNotFound)
+		return
+	}
+
+	jwksJSON, err := p.registerTokenManager.GetJWKSJSON()
+	if err != nil {
+		http.Error(rw, "failed to generate JWKS", http.StatusInternalServerError)
+		return
+	}
+
+	rw.Write(jwksJSON)
 }
 
 // SignOut sends a response to clear the authentication cookie
@@ -1034,6 +1211,24 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 		// In OTK mode, generate a one-time key instead of setting a cookie
 		if p.otkEnabled && p.otkStore != nil {
+			// Check if user exists in mapping before generating OTK
+			if p.userMapper != nil && p.registerTokenManager != nil {
+				if !p.userMapper.HasUser(session.User) {
+					// User not found, redirect to registration page
+					token, err := p.registerTokenManager.GenerateToken(session.User, p.appID, p.ssoServerURL)
+					if err != nil {
+						logger.Errorf("Error generating registration token: %v", err)
+						p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+						return
+					}
+
+					registerRedirect := fmt.Sprintf("%s#token=%s", p.registerURL, url.QueryEscape(token))
+					logger.Printf("User not found (sub: %s), redirecting to registration: %s", session.User, p.registerURL)
+					http.Redirect(rw, req, registerRedirect, http.StatusFound)
+					return
+				}
+			}
+
 			otkKey, err := otk.GenerateKey(otk.DefaultKeyLength)
 			if err != nil {
 				logger.Errorf("Error generating one-time key: %v", err)

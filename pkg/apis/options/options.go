@@ -71,6 +71,15 @@ type Options struct {
 	// One-time key user mapping file for cookieless authentication
 	OTKUserMappingFile string `flag:"otk-user-mapping-file" cfg:"otk_user_mapping_file"`
 
+	// RegisterURL is the URL to redirect to when user is not found in user mapping
+	RegisterURL string `flag:"register-url" cfg:"register_url"`
+
+	// AppID is the application identifier for the authentication server
+	AppID string `flag:"app-id" cfg:"app_id"`
+
+	// SSOServerURL is the SSO server URL for fetching user data during registration
+	SSOServerURL string `flag:"sso-server-url" cfg:"sso_server_url"`
+
 	// This is used for backwards compatibility for basic auth users
 	LegacyPreferEmailToUser bool `cfg:",internal"`
 
@@ -165,6 +174,9 @@ func NewFlagSet() *pflag.FlagSet {
 	flagSet.String("signature-key", "", "GAP-Signature request signature key (algorithm:secretkey)")
 	flagSet.Bool("gcp-healthchecks", false, "Enable GCP/GKE healthcheck endpoints")
 	flagSet.String("otk-user-mapping-file", "", "JSON file containing user mapping for one-time key authentication")
+	flagSet.String("register-url", "", "URL to redirect to when user is not found in user mapping (for registration flow)")
+	flagSet.String("app-id", "", "Application identifier for the authentication server")
+	flagSet.String("sso-server-url", "", "SSO server URL for fetching user data during registration")
 
 	flagSet.AddFlagSet(cookieFlagSet())
 	flagSet.AddFlagSet(loggingFlagSet())

@@ -53,7 +53,7 @@ func main() {
 		logger.Fatalf("%s", err)
 	}
 
-	validator := NewValidator(opts.EmailDomains, opts.AuthenticatedEmailsFile, opts.OTKUserMappingFile)
+	validator := NewValidator(opts.EmailDomains, opts.AuthenticatedEmailsFile)
 	oauthproxy, err := NewOAuthProxy(opts, validator)
 	if err != nil {
 		logger.Fatalf("ERROR: Failed to initialise OAuth2 Proxy: %v", err)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/csv"
-	"encoding/json"
 	"io"
 	"os"
 	"strings"
@@ -74,28 +73,9 @@ func (um *UserMap) LoadAuthenticatedEmailsFile() {
 	atomic.StorePointer(&um.m, unsafe.Pointer(&updated)) // #nosec G103
 }
 
-func newValidatorImpl(domains []string, usersFile string, otkUserMappingFile string,
+func newValidatorImpl(domains []string, usersFile string,
 	done <-chan bool, onUpdate func()) func(string) bool {
 	validUsers := NewUserMap(usersFile, done, onUpdate)
-
-	// Load emails from OTK user mapping file (these take priority)
-	otkEmails := make(map[string]bool)
-	if otkUserMappingFile != "" {
-		logger.Printf("loading email whitelist from OTK user mapping file: %s", otkUserMappingFile)
-		// We import the otk package function inline to avoid circular imports
-		// Read the file and parse emails
-		if data, err := os.ReadFile(otkUserMappingFile); err == nil {
-			var mapping struct {
-				Users map[string]interface{} `json:"users"`
-			}
-			if err := json.Unmarshal(data, &mapping); err == nil {
-				for email := range mapping.Users {
-					otkEmails[strings.ToLower(email)] = true
-					logger.Printf("added OTK email to whitelist: %s", email)
-				}
-			}
-		}
-	}
 
 	var allowAll bool
 	for i, domain := range domains {
@@ -112,15 +92,10 @@ func newValidatorImpl(domains []string, usersFile string, otkUserMappingFile str
 		}
 		email = strings.ToLower(email)
 
-		// Priority 1: Check OTK user mapping emails
-		if _, ok := otkEmails[email]; ok {
-			return true
-		}
-
-		// Priority 2: Check domain match
+		// Priority 1: Check domain match
 		valid = isEmailValidWithDomains(email, domains)
 		if !valid {
-			// Priority 3: Check authenticated emails file
+			// Priority 2: Check authenticated emails file
 			valid = validUsers.IsValid(email)
 		}
 		if allowAll {
@@ -132,8 +107,8 @@ func newValidatorImpl(domains []string, usersFile string, otkUserMappingFile str
 }
 
 // NewValidator constructs a function to validate email addresses
-func NewValidator(domains []string, usersFile string, otkUserMappingFile string) func(string) bool {
-	return newValidatorImpl(domains, usersFile, otkUserMappingFile, nil, func() {})
+func NewValidator(domains []string, usersFile string) func(string) bool {
+	return newValidatorImpl(domains, usersFile, nil, func() {})
 }
 
 // isEmailValidWithDomains checks if the authenticated email is validated against the provided domain

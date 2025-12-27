@@ -1,8 +1,11 @@
 {
-    "users": {
-        "lyjw131@icloud.com": {
-            "user_id": 1026,
-            "user_name": "liangyangjunwei"
+    "users": [
+        {
+            "sub": "002345.xyz789abc123def456ghi.4567",
+            "data": {
+                "user_id": 1026,
+                "user_name": "liangyangjunwei"
+            }
         }
-    }
+    ]
 }
